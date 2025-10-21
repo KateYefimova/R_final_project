@@ -6,7 +6,8 @@ date-format: iso
 format: 
   html: default
   pdf: default
-output_dir: "docs"
+execute:
+  output-dir: docs
 ---
 
 ```{r}
