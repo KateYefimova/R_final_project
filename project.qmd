@@ -435,11 +435,10 @@ ggplot(zones_transport) +
         plot.subtitle = element_text(hjust = 0.5))
 ```
 
-### 3.3 Income vs. Transportation Accessibility
-Finally, having identified where the transport deserts are, we now explore who is affected. This bubble chart plots each zone's median income against its transportation score. The size of each bubble represents population density. 
+### 3.3 Impact of New Infrastructure on Taxi Use
+We analyze whether improvements to public transit can influence behavior. This time-series plot shows the number of daily taxi trips in September 2018, before and after a new subway station opened on September 9th. 
 
-The upward trend of the red line shows a clear positive correlation: zones with higher incomes tend to have better access to transportation. Many zones belonging to the Bronx, Brooklyn, and Queens are clustered in the bottom-left corner, indicating they suffer from both lower income and lower transport access, which points to a significant equity issue
-
+There is a noticeable drop in taxi usage immediately following the station's opening. This suggests that when residents are given better public transit options, their reliance on more expensive modes of transport like taxis may decrease.
 ```{r}
 #| label: metro_opening
 #| echo: true
@@ -461,10 +460,10 @@ zones_demo_tbl %>%
 
 ```
 
-### 3.4 Impact of New Infrastructure on Taxi Use
-We analyze whether improvements to public transit can influence behavior. This time-series plot shows the number of daily taxi trips in September 2018, before and after a new subway station opened on September 9th. 
+### 3.4 Income vs. Transportation Accessibility
+Finally, having identified where the transport deserts are, we now explore who is affected. This bubble chart plots each zone's median income against its transportation score. The size of each bubble represents population density. 
 
-There is a noticeable drop in taxi usage immediately following the station's opening. This suggests that when residents are given better public transit options, their reliance on more expensive modes of transport like taxis may decrease.
+The upward trend of the red line shows a clear positive correlation: zones with higher incomes tend to have better access to transportation. Many zones belonging to the Bronx, Brooklyn, and Queens are clustered in the bottom-left corner, indicating they suffer from both lower income and lower transport access, which points to a significant equity issue
 
 ```{r}
 #| label: income_vs_transport
