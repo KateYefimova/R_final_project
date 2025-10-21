@@ -6,7 +6,7 @@ date-format: iso
 format: 
   html: default
   pdf: default
-output-dir: docs
+output_dir: "docs"
 ---
 
 ```{r}
