@@ -1,0 +1,545 @@
+---
+title: "Smart City Data Hackathon: NYC Transport Accessibility"
+author: Viktoriia Semenko, Kateryna Yefimova
+date: today
+date-format: iso
+format: 
+  html: default
+  pdf: default
+---
+
+```{r}
+#| label: setup
+#| results: hide
+#| include: false
+
+library(pacman)
+
+p_load(
+  arrow,
+  dplyr,
+  sf,
+  readr,
+  tidycensus,
+  units,
+  ggplot2,
+  leaflet,
+  scales
+)
+```
+
+
+# 1. Introduction: Identifying NYC's Transport Deserts
+
+New York City's public and private transport systems are vital to its economy and the well-being of its citizens. However, access to these systems is not uniform across the five boroughs. This project seeks to answer a critical question: **Where are the underserved zones with poor transport connectivity, and what can the city do to improve them?**
+
+To address this, we combine data on taxi trips, subway station locations, and CitiBike availability to create a comprehensive "transport accessibility score" for each taxi zone. Our goal is to identify these so-called "transport deserts" and propose practical, data-informed solutions to improve mobility and equity for all New Yorkers.
+
+## Load All Raw Data
+
+### 1.1 Setup: load census API key
+```{r}
+#| label: api
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+# New York demographics data
+census_api <- Sys.getenv("CENSUS_API")
+census_year <- 2021
+tidycensus::census_api_key(census_api, install = FALSE, overwrite = FALSE)
+```
+
+### 1.2 Load geographic data: NYC Taxi Zones
+```{r}
+#| label: load_data
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+# lookup table with zone names
+zones <- read_csv("https://d37ci6vzurychx.cloudfront.net/misc/taxi+_zone_lookup.csv") %>%
+  select(LocationID, Borough, Zone, service_zone)
+zones_sf <- st_read("data/taxi_zones/taxi_zones.shp") %>%
+  st_transform(4326) %>%
+  left_join(zones %>% select(LocationID, Borough, Zone), by = "LocationID")
+
+# Read taxi trip data from a Parquet file
+tlc <- arrow::read_parquet("data/yellow_tripdata_2025-08.parquet", col_select = c(
+  "tpep_pickup_datetime",
+  "tpep_dropoff_datetime",
+  "PULocationID",
+  "DOLocationID"
+)) %>%
+  as_tibble() %>%
+  mutate(
+    pickup_dt = lubridate::ymd_hms(tpep_pickup_datetime, tz = "UTC", quiet = TRUE),
+    dropoff_dt = lubridate::ymd_hms(tpep_dropoff_datetime, tz = "UTC", quiet = TRUE)
+  ) %>%
+  filter(!is.na(PULocationID), !is.na(DOLocationID), !is.na(pickup_dt), !is.na(dropoff_dt))
+```
+
+### 1.3 Load geographic data: subway station locations
+```{r}
+#| label: load_subway
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+mta_stations_path <- "data/MTA_Subway_Stations.csv"
+mta_sf <- read_csv(mta_stations_path) %>%
+  rename(lon = `GTFS Longitude`, lat = `GTFS Latitude`) %>%
+  filter(!is.na(lon), !is.na(lat)) %>%
+  st_as_sf(coords = c("lon","lat"), crs = 4326)
+```
+
+### 1.4 Load geographic data: CitiBike stations
+```{r}
+#| label: load_CitiBike
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+citibike_station_url <- "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
+citibike_json <- jsonlite::fromJSON(citibike_station_url)
+stations_df <- citibike_json$data$stations %>%
+  as_tibble() %>%
+  rename(station_id = station_id,
+         station_name = name,
+         lat = lat,
+         lon = lon) %>%
+  mutate(station_id = as.character(station_id))
+stations_sf <- st_as_sf(stations_df, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+
+``` 
+
+### 1.5 Load demographic data from US census
+```{r}
+#| label: demographic
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+ny_counties <- c("Bronx","Kings","New York","Queens","Richmond") 
+vars <- c(median_income = "B19013_001", total_pop = "B01003_001")
+tracts_list <- lapply(ny_counties, function(cnty) {
+  get_acs(geography = "tract",
+          state = "NY",
+          county = cnty,
+          variables = vars,
+          year = census_year,
+          geometry = TRUE,
+          output = "wide")
+})
+tracts_sf <- bind_rows(tracts_list) %>% st_transform(4326)
+tracts_sf <- tracts_sf %>%
+  mutate(
+    area_m2 = as.numeric(st_area(geometry)),
+    pop_density_km2 = (total_popE) / (area_m2/1e6),
+    median_income = median_incomeE
+  )
+
+```
+
+## Data Preparation
+
+### 1.6 Combining taxis with zones
+```{r}
+#| label: combining
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+taxi_counts <- tlc %>%
+  group_by(PULocationID) %>%
+  summarise(taxi_trips = n(), .groups = "drop")
+
+taxi_sf <- zones_sf %>%
+  left_join(taxi_counts, by = c("LocationID" = "PULocationID")) %>%
+  mutate(taxi_trips = ifelse(is.na(taxi_trips), 0, taxi_trips))
+
+zones_buffer <- st_buffer(zones_sf, dist = 500)
+```
+
+### 1.7 Determining the level of accessibility of a specific transport for each location
+```{r}
+#| label: level_of_access
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+bike_counts <- stations_sf %>%
+  st_join(zones_buffer, join = st_within) %>%
+  st_set_geometry(NULL) %>%  
+  group_by(LocationID) %>%
+  summarise(citibike_stations = n(), .groups = "drop")
+
+subway_counts <- mta_sf %>%
+  st_join(zones_buffer, join = st_within) %>%
+  st_set_geometry(NULL) %>%  
+  group_by(LocationID) %>%
+  summarise(subway_stations = n(), .groups = "drop")
+
+zones_transport <- taxi_sf %>%
+  left_join(bike_counts, by = "LocationID") %>%
+  left_join(subway_counts, by = "LocationID") %>%
+  mutate(
+    citibike_stations = ifelse(is.na(citibike_stations), 0, citibike_stations),
+    subway_stations = ifelse(is.na(subway_stations), 0, subway_stations)
+  )
+
+weight_taxi <- 1      
+weight_bike <- 0.5     
+weight_subway <- 2
+
+zones_transport <- zones_transport %>%
+  mutate(
+    taxi_norm = scale(taxi_trips),
+    bike_norm = scale(citibike_stations),
+    subway_norm = scale(subway_stations),
+    transport_score_weighted = taxi_norm*weight_taxi + bike_norm*weight_bike + subway_norm*weight_subway
+  )
+zones_transport %>%
+  arrange(transport_score_weighted) %>%
+  select(LocationID, Zone, Borough, taxi_trips, citibike_stations, subway_stations, transport_score_weighted)
+```
+
+### 1.8 Determine which zones has the lowest transport accessability 
+```{r}
+#| label: lowest
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+zones_demo <- st_join(
+  zones_transport %>% st_as_sf(coords = c("Longitude","Latitude"), crs = 4326),
+  tracts_sf %>% select(median_income, pop_density_km2, geometry),
+  join = st_nearest_feature
+)
+
+zones_demo_tbl <- zones_demo %>%
+  st_set_geometry(NULL) %>%
+  select(LocationID, Zone, Borough, transport_score_weighted, taxi_trips, citibike_stations, subway_stations,
+         median_income, pop_density_km2)
+
+threshold <- quantile(zones_demo_tbl$transport_score_weighted, 0.2)
+transport_deserts <- zones_demo_tbl %>%
+  filter(transport_score_weighted <= threshold) %>%
+  arrange(transport_score_weighted)
+
+transport_deserts
+```
+
+# 2. Determining physical accessibility to public transport and taxis
+
+## Data Preparation
+
+### 2.1 Analysis of transport availability taking into account the number of stations
+
+The purpose of this analysis is to identify areas where public transport is the least available and assess whether residents compensate for its lack by taking taxis. This allows us to identify transport “deserts” and understand how low public transport availability affects residents’ behavior.
+
+```{r}
+#| label: availability
+#| echo: true
+#| message: false
+#| warning: false
+
+zones_demo_tbl <- zones_demo_tbl %>%
+  mutate(
+    taxi_norm = scale(taxi_trips),
+    bike_norm = scale(citibike_stations),
+    subway_norm = scale(subway_stations)
+  )
+
+zones_demo_tbl <- zones_demo_tbl %>%
+  mutate(
+    public_transport_score = bike_norm + subway_norm  
+  )
+
+public_transport_threshold <- quantile(zones_demo_tbl$public_transport_score, 0.2)
+low_public_transport <- zones_demo_tbl %>%
+  filter(public_transport_score <= public_transport_threshold) %>%
+  arrange(public_transport_score) %>%
+  select(LocationID, Zone, Borough, taxi_trips, citibike_stations, subway_stations, public_transport_score)
+
+low_public_transport %>%
+  arrange(desc(taxi_trips))
+```
+
+### 2.2 Analysis of physical accessibility (distances to transport)
+
+This analysis aims to assess the physical accessibility of transport, i.e. how convenient it is to actually get to the metro or bike stations. It helps to identify areas where distance to transport infrastructure is a problem and to find out whether residents of these areas use taxis more often.
+```{r}
+#| label: physical_accessibility
+#| echo: true
+#| message: false
+#| warning: false
+
+zones_demo_sf <- zones_demo %>% st_as_sf(coords = c("Longitude","Latitude"), crs = 4326)
+
+nearest_mta_index <- st_nearest_feature(zones_demo_sf, mta_sf)
+zones_demo_sf$dist_to_metro_m <- st_distance(zones_demo_sf, mta_sf[nearest_mta_index,], by_element = TRUE)
+zones_demo_sf$dist_to_metro_m <- set_units(zones_demo_sf$dist_to_metro_m, "m") %>% drop_units()
+
+nearest_bike_index <- st_nearest_feature(zones_demo_sf, stations_sf)
+zones_demo_sf$dist_to_bike_m <- st_distance(zones_demo_sf, stations_sf[nearest_bike_index,], by_element = TRUE)
+zones_demo_sf$dist_to_bike_m <- set_units(zones_demo_sf$dist_to_bike_m, "m") %>% drop_units()
+
+zones_demo_sf <- zones_demo_sf %>%
+  left_join(taxi_sf %>% st_set_geometry(NULL) %>% select(LocationID, taxi_trips), by = "LocationID")
+
+zones_access_tbl <- zones_demo_sf %>%
+  st_set_geometry(NULL) %>%
+  select(LocationID, Zone, Borough, taxi_trips.x, dist_to_metro_m, dist_to_bike_m)
+
+cat("Top 10 zones with the greatest distance to the metro:\n")
+zones_access_tbl %>%
+  arrange(desc(dist_to_metro_m)) %>%
+  head(10) %>%
+  print()
+cat("\nTop 10 zones with the greatest distance to a CitiBike station:\n")
+zones_access_tbl %>%
+  arrange(desc(dist_to_bike_m)) %>%
+  head(10) %>%
+  print() 
+```
+
+### 2.3 Analysis of the Impact of Infrastructure Changes on Taxi Use
+We calculating the average number of daily taxi trips before a specific event (the opening of a new subway station) and compares it to the average number of trips after
+```{r}
+#| label: impact
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+policy_date <- as.Date("2018-09-09")
+
+tlc1 <- arrow::read_parquet("data/yellow_tripdata_2018-09.parquet", col_select = c(
+  "tpep_pickup_datetime",
+  "tpep_dropoff_datetime",
+  "PULocationID",
+  "DOLocationID"
+)) %>%
+  as_tibble() %>%
+  mutate(
+    pickup_dt = lubridate::ymd_hms(tpep_pickup_datetime, tz = "UTC", quiet = TRUE),
+    dropoff_dt = lubridate::ymd_hms(tpep_dropoff_datetime, tz = "UTC", quiet = TRUE)
+  ) %>%
+  filter(!is.na(PULocationID), !is.na(DOLocationID), !is.na(pickup_dt), !is.na(dropoff_dt))
+
+taxi_daily <- tlc1 %>%
+  mutate(pickup_date = as.Date(pickup_dt)) %>%
+  group_by(pickup_date) %>%
+  summarise(daily_trips = n(), .groups = "drop") %>%
+  mutate(
+    period = ifelse(pickup_date < policy_date, "Before", "After")
+  )
+
+taxi_summary <- taxi_daily %>%
+  group_by(period) %>%
+  summarise(
+    total_trips = sum(daily_trips),
+    mean_daily_trips = mean(daily_trips),
+    .groups = "drop"
+  )
+
+taxi_summary
+```
+
+
+## Visualizations: mapping NYC's mobility landscape
+
+The following visualizations tell the story of our findings. We begin by mapping individual transportation modes and then combine them to identify underserved areas and explore the socio-economic factors at play.
+
+### 3.1 Taxi Trip Pickups by NYC Zone
+This first map shows where taxi pickups are most frequent. The results are immediately clear: taxi usage is not evenly distributed. It is overwhelmingly concentrated in Manhattan and at the city's major airports (JFK and LaGuardia). The outer boroughs, where a majority of New Yorkers live, show significantly less taxi activity.
+
+This indicates that taxis primarily serve the city's commercial core and travel hubs, rather than acting as a primary transport option in residential neighborhoods.
+```{r}
+#| label: taxi_trip
+#| echo: true
+#| message: false
+#| warning: false
+
+boroughs_sf <- zones_sf %>%
+  group_by(borough) %>%
+  summarise(geometry = st_union(geometry))
+
+borough_centroids <- st_centroid(boroughs_sf)
+
+zone_taxi <- zones_sf %>%
+  left_join(taxi_counts, by = c("LocationID" = "PULocationID")) %>%
+  mutate(taxi_trips = ifelse(is.na(taxi_trips), 0, taxi_trips))
+
+ggplot(data = zone_taxi) +
+  geom_sf(aes(fill = taxi_trips), color = "white", linewidth = 0.2) +
+  geom_sf(data = boroughs_sf, fill = NA, color = "black", linewidth = 0.5) +
+  geom_sf_text(data = borough_centroids, aes(label = borough),
+               size = 4, fontface = "bold", check_overlap = TRUE) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans = "log1p",
+    breaks = c(100, 1000, 10000, 100000, 200000),
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Taxi Trip Pickups by NYC Zone",
+    fill = "Trips"
+  ) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+### 3.2 Identifying Transport Deserts
+This map visualizes our combined accessibility score, which incorporates data from taxis, subways, and bike stations. The results are stark: pink and orange, primarily in Manhattan, have high accessibility, while the dark blue "transport deserts" are clustered in the outer boroughs. 
+
+The red outlines highlight the bottom 20% of zones, making it easy to see the specific neighborhoods—particularly in Queens, eastern Brooklyn, and the Bronx—that are most underserved.
+
+```{r}
+#| label: deserts
+#| echo: true
+#| message: false
+#| warning: false
+
+ggplot(zones_transport) +
+  geom_sf(aes(fill = transport_score_weighted), color = "white", linewidth = 0.2) +
+  geom_sf(data = boroughs_sf, fill = NA, color = "black", linewidth = 0.5) +
+  geom_sf( # highlight transport deserts (lowest 20%)
+    data = filter(zones_transport, transport_score_weighted <= 
+                    quantile(transport_score_weighted, 0.2, na.rm = TRUE)),
+    fill = NA, color = "red", size = 0.5
+  ) +
+  geom_sf_text(data = borough_centroids, aes(label = borough),
+               size = 4, fontface = "bold", check_overlap = TRUE, color = "white") +
+  scale_fill_viridis_c(
+    name = "Transport Score",
+    option = "plasma",
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Transportation accessibility score by NYC Zone",
+    subtitle = "Higher = more taxi, bike, and subway access. \nRed outlines show 'transport deserts'."
+  ) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+### 3.3 Income vs. Transportation Accessibility
+Finally, having identified where the transport deserts are, we now explore who is affected. This bubble chart plots each zone's median income against its transportation score. The size of each bubble represents population density. 
+
+The upward trend of the red line shows a clear positive correlation: zones with higher incomes tend to have better access to transportation. Many zones belonging to the Bronx, Brooklyn, and Queens are clustered in the bottom-left corner, indicating they suffer from both lower income and lower transport access, which points to a significant equity issue
+
+```{r}
+#| label: metro_opening
+#| echo: true
+#| message: false
+#| warning: false
+
+zones_demo_tbl %>%
+  ggplot(aes(x = median_income, y = transport_score_weighted)) +
+  geom_point(alpha = 0.6, aes(size = pop_density_km2, color = Borough)) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  scale_x_continuous(labels = scales::dollar) +
+  scale_size_continuous(name = "Population Density") +
+  labs(
+    title = "Income vs Transportation Accessibility",
+    x = "Median Income",
+    y = "Transportation acess Score",
+  ) +
+  theme_minimal()
+
+```
+
+### 3.4 Impact of New Infrastructure on Taxi Use
+We analyze whether improvements to public transit can influence behavior. This time-series plot shows the number of daily taxi trips in September 2018, before and after a new subway station opened on September 9th. 
+
+There is a noticeable drop in taxi usage immediately following the station's opening. This suggests that when residents are given better public transit options, their reliance on more expensive modes of transport like taxis may decrease.
+
+```{r}
+#| label: income_vs_transport
+#| echo: true
+#| message: false
+#| warning: false
+
+taxi_daily %>%
+  filter(pickup_date >= as.Date("2018-09-01"),
+         pickup_date <= as.Date("2018-09-30")) %>%
+  ggplot(aes(x = pickup_date, y = daily_trips, color = period)) +
+  geom_line(size = 1) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  geom_vline(xintercept = policy_date, linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("Before" = "blue", "After" = "orange")) +
+  scale_y_continuous(
+    labels = scales::comma,
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  scale_x_date(
+    date_breaks = "3 days",
+    date_labels = "%b %d"
+  ) +
+  labs(
+    title = "Daily Taxi trips before and after metro station opening",
+    x = "Date (Sept 2018)",
+    y = "Daily trips",
+    color = "Period"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10)),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+The opening of new metro stations shows a measurable impact on taxi usage patterns, suggesting that improved public transport infrastructure can reduce reliance on more expensive transportation options like taxis.
+
+
+# 4. Policy or design recommendations.
+
+## Problems
+
+### 1. Transportation deserts
+ - East Queens, South Bronx, some areas of Staten Island
+ - Distance to the subway 1.5-3 km, limited access to bike sharing
+ - For Kyiv: Troyeshchyna, Vynohradar, Borshchahivka, some areas of the Left Bank
+
+### 2. Economic inequality
+ - Poor areas have worse transport access
+ - High transport costs for low-income citizens
+ - For Kyiv: Remote areas with lower income
+
+### 3. Fragmentation of services
+ - Different modes of transport are not integrated with each other
+ - Lack of a unified planning and payment system
+ - For Kyiv: Metro, buses, minibuses, bike sharing operate separately
+
+## Possible solutions
+
+### 1. Transport Deserts
+
+ - Expanding public transport networks: additional bus routes, light rail, or metro extensions in underserved areas.
+ - Mobile transport hubs: small hubs with bike-sharing and public transport stops to reduce the distance to the nearest metro or station.
+ - Encouraging micromobility: introducing electric scooters and bike-sharing options in areas with limited metro access.
+
+### 2. Economic Inequality
+
+ - Social fares for transport: discounts or subsidies for residents in low-income areas.
+ - Multi-modal cards and payments: a single card for metro, buses, minibuses, and bike-sharing to reduce costs and simplify usage.
+
+### 3. Fragmentation of Services
+
+ - Integrated route planning: develop a mobile app or platform that combines metro, buses, minibuses, and bike-sharing, allowing door-to-door trip planning.
+ - Unified payment system: a single card or app for all transport modes, with automated tariffs and incentives for combining different types of transport.
+
